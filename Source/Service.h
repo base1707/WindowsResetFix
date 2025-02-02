@@ -1,22 +1,28 @@
 #pragma once
 
+#include <string>
+#include <string_view>
+#include <fstream>
+#include <filesystem>
 #include <vector>
 #include <memory>
 #include <atlstr.h>
 #include <WtsApi32.h>
-
 #include "API.h"
+
+constexpr std::size_t HASH_SIZE = 32;
 
 namespace SERVICE
 {
-    static std::vector<LPCSTR> TARGET_PATHS =
+    static std::vector<std::wstring> TARGET_PATHS =
     {
-        "C:\\Windows\\System32\\utilman.exe",
-        "C:\\Windows\\System32\\find.exe",
-        "C:\\Windows\\System32\\osk.exe"
+        L"C:\\Windows\\System32\\utilman.exe",
+        L"C:\\Windows\\System32\\find.exe",
+        L"C:\\Windows\\System32\\osk.exe",
+        L"C:\\Windows\\System32\\sethc.exe"
     };
 
-    constexpr LPCSTR HASH_PATH = "C:\\Windows\\System32\\BASE1707.hash";
+    constexpr LPCWSTR HASH_PATH = L"C:\\Windows\\System32\\BASE1707.hash";
     constexpr LPCWSTR NAME = L"FixWR";
 }
 
@@ -51,19 +57,17 @@ class CWRService final : public IService
 {
 private:
     CString name;
-
-private:
     SERVICE_STATUS status;
     SERVICE_STATUS_HANDLE statusHandle;
+
+    CWRService();
+    friend class std::shared_ptr<CWRService>;
 
 public:
     CWRService(const CWRService&) = delete;
     CWRService& operator=(const CWRService&) = delete;
-
     CWRService(CWRService&&) = delete;
     CWRService& operator=(CWRService&&) = delete;
-
-    CWRService();
 
 public:
     static std::shared_ptr<CWRService> GetInstance();
@@ -73,8 +77,6 @@ public:
 public:
     bool Install() override;
     bool Uninstall() override;
-
-public:
     bool Run() override;
     void OnStart(DWORD argc, TCHAR* argv[]) override;
 
@@ -90,6 +92,10 @@ public:
 
 private:
     void WriteToEventLog(const CString& msg, WORD type = EVENTLOG_INFORMATION_TYPE) override;
+    void TriggerAlarm();
+
+private:
+    std::vector<BYTE> GetFileHash(const std::wstring& path);
 };
 
 class CServiceHandle final
@@ -98,15 +104,14 @@ private:
     SC_HANDLE handle;
 
 public:
+    explicit CServiceHandle(SC_HANDLE h = nullptr) : handle(h) {}
+    ~CServiceHandle() { if (handle) CloseServiceHandle(handle); }
+
     CServiceHandle(const CServiceHandle&) = delete;
     CServiceHandle& operator=(const CServiceHandle&) = delete;
-
     CServiceHandle(CServiceHandle&&) = delete;
     CServiceHandle& operator=(CServiceHandle&&) = delete;
 
-    CServiceHandle(SC_HANDLE serviceHandle);
-    ~CServiceHandle();
-
-public:
-    operator SC_HANDLE();
+    explicit operator SC_HANDLE() const { return handle; }
+    bool IsValid() const { return handle != nullptr; }
 };

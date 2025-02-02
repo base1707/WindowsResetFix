@@ -1,6 +1,6 @@
 #include "Service.h"
 
-CWRService::CWRService() : name{ SERVICE::NAME }, status{}, statusHandle{}
+CWRService::CWRService() : name(SERVICE::NAME), status{}, statusHandle(nullptr)
 {
     status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SESSIONCHANGE;
     status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
@@ -13,30 +13,45 @@ CWRService::CWRService() : name{ SERVICE::NAME }, status{}, statusHandle{}
 
 std::shared_ptr<CWRService> CWRService::GetInstance()
 {
-    static std::shared_ptr<CWRService> instance{ new CWRService() };
+    static std::shared_ptr<CWRService> instance(new CWRService());
     return instance;
 }
 
 void WINAPI CWRService::SvcMain(DWORD argc, TCHAR* argv[])
 {
     auto instance = GetInstance();
+    instance->statusHandle = RegisterServiceCtrlHandlerEx(
+        instance->name,
+        ServiceCtrlHandler,
+        nullptr
+    );
 
-    if (instance->statusHandle = RegisterServiceCtrlHandlerEx(instance->name, ServiceCtrlHandler, nullptr))
+    if (!instance->statusHandle)
     {
-        instance->Start(argc, argv);
+        instance->WriteToEventLog(L"RegisterServiceCtrlHandlerEx failed", EVENTLOG_ERROR_TYPE);
+        return;
     }
-    else
-    {
-        instance->WriteToEventLog(L"RegisterServiceCtrlHandlerEx() failed!", EVENTLOG_ERROR_TYPE);
-    }
+
+    instance->Start(argc, argv);
 }
 
-DWORD WINAPI CWRService::ServiceCtrlHandler(DWORD Code, DWORD, void*, void*)
+DWORD WINAPI CWRService::ServiceCtrlHandler(DWORD code, DWORD eventType, void*, void*)
 {
     auto instance = GetInstance();
 
-    switch (Code)
+    switch (code)
     {
+        case SERVICE_CONTROL_SESSIONCHANGE:
+        {
+            if (eventType == WTS_SESSION_LOGON)
+                instance->WriteToEventLog(L"New login session detected");
+        } break;
+
+        case SERVICE_CONTROL_INTERROGATE:
+        {
+            SetServiceStatus(instance->statusHandle, &instance->status);
+        } break;
+
         case SERVICE_CONTROL_STOP:
         {
             instance->Stop();
@@ -57,133 +72,213 @@ DWORD WINAPI CWRService::ServiceCtrlHandler(DWORD Code, DWORD, void*, void*)
             instance->Shutdown();
         } break;
 
-        // Unsupported
         default:
         {
         } break;
     }
-    return 0;
+    return NO_ERROR;
 }
 
 bool CWRService::Install()
 {
-    CString path;
-    TCHAR* modulePath = path.GetBufferSetLength(MAX_PATH);
-
-    if (GetModuleFileName(nullptr, modulePath, MAX_PATH) == 0)
+    TCHAR modulePath[MAX_PATH];
+    if (!GetModuleFileName(nullptr, modulePath, MAX_PATH))
+    {
+        WriteToEventLog(L"GetModuleFileName failed", EVENTLOG_ERROR_TYPE);
         return false;
+    }
 
-    path.ReleaseBuffer();
+    CString path(modulePath);
     path.Remove(L'\"');
     path = L'\"' + path + L'\"';
 
-    CServiceHandle controlManager = OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
-    if (!controlManager)
+    CServiceHandle scManager(OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE));
+    if (!scManager.IsValid())
+    {
+        CString errorMsg;
+        errorMsg.Format(L"OpenSCManager failed (Error: %d)", GetLastError());
+        WriteToEventLog(errorMsg, EVENTLOG_ERROR_TYPE);
         return false;
+    }
 
-    CServiceHandle handle = CreateService(controlManager, name, name, SERVICE_QUERY_STATUS, SERVICE_WIN32_OWN_PROCESS,
-        SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, path, nullptr, nullptr, nullptr, nullptr, nullptr);
-    return !!handle;
+    CServiceHandle service(CreateServiceW(
+        static_cast<SC_HANDLE>(scManager),
+        SERVICE::NAME,
+        SERVICE::NAME,
+        SERVICE_ALL_ACCESS,
+        SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_AUTO_START,
+        SERVICE_ERROR_NORMAL,
+        path,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr
+    ));
+
+    if (!service.IsValid())
+    {
+        CString errorMsg;
+        errorMsg.Format(L"CreateService failed (Error: %d)", GetLastError());
+        WriteToEventLog(errorMsg, EVENTLOG_ERROR_TYPE);
+        return false;
+    }
+
+    SERVICE_DESCRIPTION description;
+    CString descText = L"Служба для защиты системных утилит (utilman, find, osk, sethc) от подмены.";
+    description.lpDescription = descText.GetBuffer();
+    descText.ReleaseBuffer();
+    if (!ChangeServiceConfig2(static_cast<SC_HANDLE>(service), SERVICE_CONFIG_DESCRIPTION, &description))
+    {
+        DWORD err = GetLastError();
+        CString msg;
+        msg.Format(L"Service description error: 0x%08X", err);
+        WriteToEventLog(msg, EVENTLOG_WARNING_TYPE);
+    }
+
+    SC_ACTION actions[] = { { SC_ACTION_RESTART, 60000 } };
+    SERVICE_FAILURE_ACTIONS failureActions = { 86400, nullptr, nullptr, 1, actions };
+    if (!ChangeServiceConfig2(static_cast<SC_HANDLE>(service), SERVICE_CONFIG_FAILURE_ACTIONS, &failureActions))
+    {
+        DWORD err = GetLastError();
+        CString msg;
+        msg.Format(L"Failure actions error: 0x%08X", err);
+        WriteToEventLog(msg, EVENTLOG_WARNING_TYPE);
+    }
+
+    WriteToEventLog(L"Service installed successfully");
+    return true;
 }
 
 bool CWRService::Uninstall()
 {
-    CServiceHandle controlManager = OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (!controlManager)
+    CServiceHandle scManager(OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT));
+    if (!scManager.IsValid())
+    {
+        WriteToEventLog(L"OpenSCManager failed", EVENTLOG_ERROR_TYPE);
         return false;
+    }
 
-    CServiceHandle handle = OpenService(controlManager, name, SERVICE_QUERY_STATUS | SERVICE_STOP | DELETE);
-    if (!handle)
+    CServiceHandle service(OpenService(static_cast<SC_HANDLE>(scManager), name, SERVICE_STOP | DELETE));
+    if (!service.IsValid())
+    {
+        WriteToEventLog(L"OpenService failed", EVENTLOG_ERROR_TYPE);
         return false;
+    }
 
     SERVICE_STATUS status{};
-    if (ControlService(handle, SERVICE_CONTROL_STOP, &status))
+    if (ControlService(static_cast<SC_HANDLE>(service), SERVICE_CONTROL_STOP, &status))
     {
-        while (QueryServiceStatus(handle, &status))
+        while (QueryServiceStatus(static_cast<SC_HANDLE>(service), &status))
         {
-            if (status.dwCurrentState != SERVICE_STOP_PENDING)
-                break;
+            if (status.dwCurrentState == SERVICE_STOPPED) break;
+            Sleep(500);
         }
-
-        if (status.dwCurrentState != SERVICE_STOPPED)
-            return false;
     }
-    return !!DeleteService(handle);
+
+    if (!DeleteService(static_cast<SC_HANDLE>(service)))
+    {
+        WriteToEventLog(L"DeleteService failed", EVENTLOG_ERROR_TYPE);
+        return false;
+    }
+
+    WriteToEventLog(L"Service uninstalled");
+    return true;
 }
 
 bool CWRService::Run()
 {
-    SERVICE_TABLE_ENTRY ServiceTable[] =
+    CString serviceName = name;
+    SERVICE_TABLE_ENTRY dispatchTable[] =
     {
-        { const_cast<CString&>(GetInstance()->name).GetBuffer(), SvcMain },
+        { serviceName.GetBuffer(), SvcMain },
         { nullptr, nullptr }
     };
+    serviceName.ReleaseBuffer();
 
-    return StartServiceCtrlDispatcher(ServiceTable) == TRUE;
+    if (!StartServiceCtrlDispatcher(dispatchTable))
+    {
+        WriteToEventLog(L"StartServiceCtrlDispatcher failed", EVENTLOG_ERROR_TYPE);
+        return false;
+    }
+    return true;
 }
 
 void CWRService::OnStart(DWORD, TCHAR* [])
 {
-    static const std::size_t HASH_SIZE = 20;
-    std::ifstream file{ SERVICE::HASH_PATH, std::ios::binary };
-    std::string buffer;
-
-    // Reading
-    if (file.is_open())
+    try
     {
-        auto alarmMode = [&]()
-        {
-            file.close();
+        std::vector<std::vector<BYTE>> validHashes;
+        std::ifstream hashFile(SERVICE::HASH_PATH, std::ios::binary);
 
-            // Legacy API, sorry
-            if (Windows::SetPrivileges(SE_SHUTDOWN_NAME))
-            {
-                ExitWindowsEx(EWX_FORCE | EWX_SHUTDOWN, 0);
-            }
-            else
-            {
-                WriteToEventLog(L"ExitWindowsEx() failed!", EVENTLOG_ERROR_TYPE);
-            }
-        };
-
-        for (auto& it : SERVICE::TARGET_PATHS)
+        if (hashFile)
         {
-            buffer = Filesystem::GetHashFromFile(it);
-            if (buffer != Filesystem::ReadHash(file, HASH_SIZE))
+            for (const auto& target : SERVICE::TARGET_PATHS)
             {
-                alarmMode();
+                auto currentHash = GetFileHash(target);
+                std::vector<BYTE> storedHash(HASH_SIZE);
+
+                if (!hashFile.read(reinterpret_cast<char*>(storedHash.data()), storedHash.size()) || currentHash != storedHash)
+                {
+                    TriggerAlarm();
+                    return;
+                }
+            }
+
+            if (hashFile.get() != EOF)
+            {
+                WriteToEventLog(L"Hash file corrupted", EVENTLOG_WARNING_TYPE);
+                TriggerAlarm();
                 return;
             }
+
+            WriteToEventLog(L"Hash is ok!", EVENTLOG_SUCCESS);
+        }
+        else
+        {
+            std::ofstream newHashFile(SERVICE::HASH_PATH, std::ios::binary);
+            if (!newHashFile)
+            {
+                WriteToEventLog(L"Failed to create hash file", EVENTLOG_ERROR_TYPE);
+                return;
+            }
+
+            for (const auto& target : SERVICE::TARGET_PATHS)
+            {
+                auto hash = GetFileHash(target);
+                newHashFile.write(reinterpret_cast<const char*>(hash.data()), hash.size());
+            }
+
+            WriteToEventLog(L"Hash file created", EVENTLOG_SUCCESS);
         }
     }
-    // Writing
-    else
+    catch (const std::exception& ex)
     {
-        std::ofstream hashFile{ SERVICE::HASH_PATH, std::ios::binary};
-        if (!hashFile.is_open())
-        {
-            WriteToEventLog("hashFile broken!", EVENTLOG_ERROR_TYPE);
-            return;
-        }
-
-        for (auto& it : SERVICE::TARGET_PATHS)
-        {
-            buffer = Filesystem::GetHashFromFile(it);
-            if (!Filesystem::WriteHash(hashFile, buffer, HASH_SIZE))
-            {
-                WriteToEventLog("hashFile broken!", EVENTLOG_ERROR_TYPE);
-                return;
-            }
-        }
+        CString msg;
+        msg.Format(L"Critical error: %S", ex.what());
+        WriteToEventLog(msg, EVENTLOG_ERROR_TYPE);
     }
 }
 
-void CWRService::SetStatus(DWORD dwState, DWORD dwErrCode, DWORD dwWait)
+void CWRService::TriggerAlarm()
 {
-    status.dwCurrentState = dwState;
-    status.dwWin32ExitCode = dwErrCode;
-    status.dwWaitHint = dwWait;
+    if (Windows::SetPrivileges(SE_SHUTDOWN_NAME))
+    {
+        WriteToEventLog(L"Trigger!", EVENTLOG_ERROR_TYPE);
+        ExitWindowsEx(EWX_SHUTDOWN | EWX_FORCE, 0);
+    }
+    else
+    {
+        WriteToEventLog(L"Failed to acquire shutdown privileges", EVENTLOG_ERROR_TYPE);
+    }
+}
 
+void CWRService::SetStatus(DWORD state, DWORD errorCode, DWORD waitHint)
+{
+    status.dwCurrentState = state;
+    status.dwWin32ExitCode = errorCode;
+    status.dwWaitHint = waitHint;
     SetServiceStatus(statusHandle, &status);
 }
 
@@ -219,26 +314,74 @@ void CWRService::Shutdown()
 
 void CWRService::WriteToEventLog(const CString& msg, WORD type)
 {
-    if (HANDLE hSource = RegisterEventSource(nullptr, name))
+    if (HANDLE eventSrc = RegisterEventSource(nullptr, name))
     {
-        const TCHAR* msgData[2] = { name, msg };
-        ReportEvent(hSource, type, 0, 0, nullptr, 2, 0, msgData, nullptr);
-        DeregisterEventSource(hSource);
+        const TCHAR* strings[2] = { name, msg };
+        ReportEvent(eventSrc, type, 0, 0, nullptr, 2, 0, strings, nullptr);
+        DeregisterEventSource(eventSrc);
     }
 }
 
-CServiceHandle::CServiceHandle(SC_HANDLE serviceHandle) : handle(serviceHandle) 
-{}
-
-CServiceHandle::~CServiceHandle()
+std::vector<BYTE> CWRService::GetFileHash(const std::wstring& path)
 {
-    if (handle)
+    constexpr LPCWSTR ALGORITHM = BCRYPT_SHA256_ALGORITHM;
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    if (BCryptOpenAlgorithmProvider(&hAlg, ALGORITHM, NULL, 0) != 0)
     {
-        CloseServiceHandle(handle);
+        WriteToEventLog(L"Algorithm provider error", EVENTLOG_ERROR_TYPE);
+        return {};
     }
-}
 
-CServiceHandle::operator SC_HANDLE()
-{
-    return handle;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    if (BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0) != 0)
+    {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        WriteToEventLog(L"Hash creation error", EVENTLOG_ERROR_TYPE);
+        return {};
+    }
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+    {
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+
+        WriteToEventLog(L"File open error", EVENTLOG_ERROR_TYPE);
+        return {};
+    }
+
+    constexpr size_t BUFFER_SIZE = 4096;
+    char buffer[BUFFER_SIZE];
+    while (file.read(buffer, BUFFER_SIZE) || file.gcount() > 0)
+    {
+        if (BCryptHashData(hHash, reinterpret_cast<PUCHAR>(buffer), static_cast<ULONG>(file.gcount()), 0) != 0)
+        {
+            BCryptDestroyHash(hHash);
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            WriteToEventLog(L"Hashing error", EVENTLOG_ERROR_TYPE);
+            return {};
+        }
+    }
+
+    DWORD hashSize = 0;
+    DWORD resultSize = 0;
+    if (BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashSize), sizeof(hashSize), &resultSize, 0) != 0)
+    {
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        WriteToEventLog(L"Hash size error", EVENTLOG_ERROR_TYPE);
+        return {};
+    }
+
+    std::vector<BYTE> result(hashSize);
+    NTSTATUS status = BCryptFinishHash(hHash, result.data(), hashSize, 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+
+    if (status != 0)
+    {
+        WriteToEventLog(L"Hash finalization error", EVENTLOG_ERROR_TYPE);
+        return {};
+    }
+    return result;
 }
